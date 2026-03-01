@@ -162,7 +162,6 @@ Action BuildAndSolveFrontier() {
     return id;
   };
 
-  std::vector<double> heuristic_probability;
   for (int r = 0; r < rows; ++r) {
     for (int c = 0; c < columns; ++c) {
       if (!IsNumberCell(known_map[r][c])) {
@@ -242,8 +241,18 @@ Action BuildAndSolveFrontier() {
     }
   }
 
-  constexpr int kMaxExactCells = 22;
+  constexpr int kMaxExactCells = 24;
   mine_probability.assign(frontier_cells.size(), std::numeric_limits<double>::quiet_NaN());
+
+  struct ComponentModel {
+    std::vector<int> global_cells;
+    std::vector<long double> ways_by_mines;
+    std::vector<std::vector<long double>> mine_ways_by_cell;
+  };
+
+  std::vector<ComponentModel> component_models;
+  std::vector<int> frontier_component(frontier_cells.size(), -1);
+  std::vector<int> frontier_local(frontier_cells.size(), -1);
 
   std::vector<char> visited_cell(frontier_cells.size(), 0);
   std::vector<char> visited_constraint(constraints.size(), 0);
@@ -305,8 +314,10 @@ Action BuildAndSolveFrontier() {
     std::vector<int> assigned_mines(m, 0);
     std::vector<int> unassigned(m, 0);
     std::vector<int> assign(n, -1);
-    std::vector<long long> mine_solutions(n, 0);
-    long long total_solutions = 0;
+    std::vector<long double> solutions_by_mines(n + 1, 0.0L);
+    std::vector<std::vector<long double>> mine_solutions_by_mines(n, std::vector<long double>(n + 1, 0.0L));
+    long double total_solutions = 0.0L;
+    int assigned_mine_total = 0;
 
     for (int cid = 0; cid < m; ++cid) {
       unassigned[cid] = static_cast<int>(local_constraints[cid].vars.size());
@@ -323,10 +334,11 @@ Action BuildAndSolveFrontier() {
 
     std::function<void(int)> dfs = [&](int idx) {
       if (idx == n) {
-        ++total_solutions;
+        total_solutions += 1.0L;
+        solutions_by_mines[assigned_mine_total] += 1.0L;
         for (int v = 0; v < n; ++v) {
           if (assign[v] == 1) {
-            ++mine_solutions[v];
+            mine_solutions_by_mines[v][assigned_mine_total] += 1.0L;
           }
         }
         return;
@@ -343,9 +355,11 @@ Action BuildAndSolveFrontier() {
           }
         }
         assign[v] = val;
+        assigned_mine_total += val;
         if (ok) {
           dfs(idx + 1);
         }
+        assigned_mine_total -= val;
         assign[v] = -1;
         for (int cid : local_incident[v]) {
           assigned_mines[cid] -= val;
@@ -358,16 +372,152 @@ Action BuildAndSolveFrontier() {
     if (total_solutions == 0) {
       continue;
     }
+
+    int comp_index = static_cast<int>(component_models.size());
+    ComponentModel model;
+    model.global_cells = comp_cells;
+    model.ways_by_mines = solutions_by_mines;
+    model.mine_ways_by_cell = mine_solutions_by_mines;
+    component_models.push_back(model);
+
     for (int local = 0; local < n; ++local) {
       int global = comp_cells[local];
-      if (mine_solutions[local] == 0) {
+      frontier_component[global] = comp_index;
+      frontier_local[global] = local;
+      long double mine_sum = 0.0L;
+      for (int k = 0; k <= n; ++k) {
+        mine_sum += mine_solutions_by_mines[local][k];
+      }
+      if (mine_sum == 0.0L) {
         forced_safe[global] = 1;
         mine_probability[global] = 0.0;
-      } else if (mine_solutions[local] == total_solutions) {
+      } else if (mine_sum == total_solutions) {
         forced_mine[global] = 1;
         mine_probability[global] = 1.0;
       } else {
-        mine_probability[global] = static_cast<double>(mine_solutions[local]) / static_cast<double>(total_solutions);
+        mine_probability[global] = static_cast<double>(mine_sum / total_solutions);
+      }
+    }
+  }
+
+  int remaining_mines = total_mines - marked_count;
+  if (remaining_mines < 0) {
+    remaining_mines = 0;
+  }
+  if (remaining_mines > unknown_count) {
+    remaining_mines = unknown_count;
+  }
+
+  int unresolved_frontier = 0;
+  for (int id = 0; id < static_cast<int>(frontier_cells.size()); ++id) {
+    if (frontier_component[id] == -1) {
+      ++unresolved_frontier;
+    }
+  }
+  int unconstrained_unknown = unknown_count - static_cast<int>(frontier_cells.size());
+
+  double global_prob = unknown_count > 0 ? static_cast<double>(remaining_mines) / static_cast<double>(unknown_count) : 1.0;
+  global_prob = std::clamp(global_prob, 0.0, 1.0);
+
+  if (unresolved_frontier == 0 && !component_models.empty()) {
+    std::vector<long double> comb(unconstrained_unknown + 1, 0.0L);
+    comb[0] = 1.0L;
+    for (int i = 1; i <= unconstrained_unknown; ++i) {
+      comb[i] = comb[i - 1] * static_cast<long double>(unconstrained_unknown - i + 1) / static_cast<long double>(i);
+    }
+
+    int comp_count = static_cast<int>(component_models.size());
+    std::vector<std::vector<long double>> prefix(comp_count + 1, std::vector<long double>(remaining_mines + 1, 0.0L));
+    std::vector<std::vector<long double>> suffix(comp_count + 1, std::vector<long double>(remaining_mines + 1, 0.0L));
+    prefix[0][0] = 1.0L;
+    for (int i = 0; i < comp_count; ++i) {
+      for (int used = 0; used <= remaining_mines; ++used) {
+        if (prefix[i][used] == 0.0L) {
+          continue;
+        }
+        for (int k = 0; k < static_cast<int>(component_models[i].ways_by_mines.size()); ++k) {
+          if (component_models[i].ways_by_mines[k] == 0.0L || used + k > remaining_mines) {
+            continue;
+          }
+          prefix[i + 1][used + k] += prefix[i][used] * component_models[i].ways_by_mines[k];
+        }
+      }
+    }
+    suffix[comp_count][0] = 1.0L;
+    for (int i = comp_count - 1; i >= 0; --i) {
+      for (int used = 0; used <= remaining_mines; ++used) {
+        if (suffix[i + 1][used] == 0.0L) {
+          continue;
+        }
+        for (int k = 0; k < static_cast<int>(component_models[i].ways_by_mines.size()); ++k) {
+          if (component_models[i].ways_by_mines[k] == 0.0L || used + k > remaining_mines) {
+            continue;
+          }
+          suffix[i][used + k] += suffix[i + 1][used] * component_models[i].ways_by_mines[k];
+        }
+      }
+    }
+
+    long double denominator = 0.0L;
+    for (int used = 0; used <= remaining_mines; ++used) {
+      int rest = remaining_mines - used;
+      if (rest < 0 || rest > unconstrained_unknown) {
+        continue;
+      }
+      denominator += prefix[comp_count][used] * comb[rest];
+    }
+
+    if (denominator > 0.0L) {
+      if (unconstrained_unknown > 0) {
+        long double unconstrained_numerator = 0.0L;
+        for (int used = 0; used <= remaining_mines; ++used) {
+          int rest = remaining_mines - used;
+          if (rest < 0 || rest > unconstrained_unknown) {
+            continue;
+          }
+          unconstrained_numerator += prefix[comp_count][used] * comb[rest] *
+                                     static_cast<long double>(rest) / static_cast<long double>(unconstrained_unknown);
+        }
+        global_prob = static_cast<double>(unconstrained_numerator / denominator);
+      } else {
+        global_prob = 1.0;
+      }
+
+      for (int ci = 0; ci < comp_count; ++ci) {
+        std::vector<long double> other_ways(remaining_mines + 1, 0.0L);
+        for (int left = 0; left <= remaining_mines; ++left) {
+          if (prefix[ci][left] == 0.0L) {
+            continue;
+          }
+          for (int right = 0; right + left <= remaining_mines; ++right) {
+            if (suffix[ci + 1][right] == 0.0L) {
+              continue;
+            }
+            other_ways[left + right] += prefix[ci][left] * suffix[ci + 1][right];
+          }
+        }
+
+        const auto &model = component_models[ci];
+        int n = static_cast<int>(model.global_cells.size());
+        for (int local = 0; local < n; ++local) {
+          long double numerator = 0.0L;
+          for (int k = 0; k < static_cast<int>(model.mine_ways_by_cell[local].size()); ++k) {
+            if (model.mine_ways_by_cell[local][k] == 0.0L || k > remaining_mines) {
+              continue;
+            }
+            for (int other = 0; other + k <= remaining_mines; ++other) {
+              if (other_ways[other] == 0.0L) {
+                continue;
+              }
+              int rest = remaining_mines - other - k;
+              if (rest < 0 || rest > unconstrained_unknown) {
+                continue;
+              }
+              numerator += model.mine_ways_by_cell[local][k] * other_ways[other] * comb[rest];
+            }
+          }
+          mine_probability[model.global_cells[local]] = static_cast<double>(numerator / denominator);
+        }
       }
     }
   }
@@ -437,13 +587,6 @@ Action BuildAndSolveFrontier() {
       return {frontier_cells[id].first, frontier_cells[id].second, 1, true};
     }
   }
-
-  int remaining_mines = total_mines - marked_count;
-  if (remaining_mines < 0) {
-    remaining_mines = 0;
-  }
-  double global_prob = unknown_count > 0 ? static_cast<double>(remaining_mines) / static_cast<double>(unknown_count) : 1.0;
-  global_prob = std::clamp(global_prob, 0.0, 1.0);
 
   int best_r = -1;
   int best_c = -1;
