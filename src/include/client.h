@@ -241,7 +241,10 @@ Action BuildAndSolveFrontier() {
     }
   }
 
-  constexpr int kMaxExactCells = 24;
+  constexpr int kMaxExactCells = 22;
+  constexpr int kMaxApproxCells = 34;
+  constexpr long long kApproxNodeLimit = 250000;
+  constexpr long long kApproxSolutionLimit = 8000;
   mine_probability.assign(frontier_cells.size(), std::numeric_limits<double>::quiet_NaN());
 
   struct ComponentModel {
@@ -284,7 +287,7 @@ Action BuildAndSolveFrontier() {
       }
     }
 
-    if (static_cast<int>(comp_cells.size()) > kMaxExactCells) {
+    if (static_cast<int>(comp_cells.size()) > kMaxApproxCells) {
       continue;
     }
 
@@ -311,16 +314,7 @@ Action BuildAndSolveFrontier() {
     int n = static_cast<int>(comp_cells.size());
     int m = static_cast<int>(local_constraints.size());
     std::vector<std::vector<int>> local_incident(n);
-    std::vector<int> assigned_mines(m, 0);
-    std::vector<int> unassigned(m, 0);
-    std::vector<int> assign(n, -1);
-    std::vector<long double> solutions_by_mines(n + 1, 0.0L);
-    std::vector<std::vector<long double>> mine_solutions_by_mines(n, std::vector<long double>(n + 1, 0.0L));
-    long double total_solutions = 0.0L;
-    int assigned_mine_total = 0;
-
     for (int cid = 0; cid < m; ++cid) {
-      unassigned[cid] = static_cast<int>(local_constraints[cid].vars.size());
       for (int v : local_constraints[cid].vars) {
         local_incident[v].push_back(cid);
       }
@@ -332,19 +326,126 @@ Action BuildAndSolveFrontier() {
       return local_incident[a].size() > local_incident[b].size();
     });
 
-    std::function<void(int)> dfs = [&](int idx) {
+    if (n <= kMaxExactCells) {
+      std::vector<int> assigned_mines(m, 0);
+      std::vector<int> unassigned(m, 0);
+      std::vector<int> assign(n, -1);
+      std::vector<long double> solutions_by_mines(n + 1, 0.0L);
+      std::vector<std::vector<long double>> mine_solutions_by_mines(n, std::vector<long double>(n + 1, 0.0L));
+      long double total_solutions = 0.0L;
+      int assigned_mine_total = 0;
+
+      for (int cid = 0; cid < m; ++cid) {
+        unassigned[cid] = static_cast<int>(local_constraints[cid].vars.size());
+      }
+
+      std::function<void(int)> dfs = [&](int idx) {
+        if (idx == n) {
+          total_solutions += 1.0L;
+          solutions_by_mines[assigned_mine_total] += 1.0L;
+          for (int v = 0; v < n; ++v) {
+            if (assign[v] == 1) {
+              mine_solutions_by_mines[v][assigned_mine_total] += 1.0L;
+            }
+          }
+          return;
+        }
+        int v = order[idx];
+        for (int val = 0; val <= 1; ++val) {
+          bool ok = true;
+          for (int cid : local_incident[v]) {
+            unassigned[cid]--;
+            assigned_mines[cid] += val;
+            int need = local_constraints[cid].mines;
+            if (assigned_mines[cid] > need || assigned_mines[cid] + unassigned[cid] < need) {
+              ok = false;
+            }
+          }
+          assign[v] = val;
+          assigned_mine_total += val;
+          if (ok) {
+            dfs(idx + 1);
+          }
+          assigned_mine_total -= val;
+          assign[v] = -1;
+          for (int cid : local_incident[v]) {
+            assigned_mines[cid] -= val;
+            unassigned[cid]++;
+          }
+        }
+      };
+      dfs(0);
+
+      if (total_solutions == 0.0L) {
+        continue;
+      }
+
+      int comp_index = static_cast<int>(component_models.size());
+      ComponentModel model;
+      model.global_cells = comp_cells;
+      model.ways_by_mines = solutions_by_mines;
+      model.mine_ways_by_cell = mine_solutions_by_mines;
+      component_models.push_back(model);
+
+      for (int local = 0; local < n; ++local) {
+        int global = comp_cells[local];
+        frontier_component[global] = comp_index;
+        frontier_local[global] = local;
+        long double mine_sum = 0.0L;
+        for (int k = 0; k <= n; ++k) {
+          mine_sum += mine_solutions_by_mines[local][k];
+        }
+        if (mine_sum == 0.0L) {
+          forced_safe[global] = 1;
+          mine_probability[global] = 0.0;
+        } else if (mine_sum == total_solutions) {
+          forced_mine[global] = 1;
+          mine_probability[global] = 1.0;
+        } else {
+          mine_probability[global] = static_cast<double>(mine_sum / total_solutions);
+        }
+      }
+      continue;
+    }
+
+    std::vector<int> assigned_mines(m, 0);
+    std::vector<int> unassigned(m, 0);
+    std::vector<int> assign(n, -1);
+    std::vector<long double> sampled_mines(n, 0.0L);
+    long double sampled_solutions = 0.0L;
+    int assigned_mine_total = 0;
+    long long visited_nodes = 0;
+    bool truncated = false;
+
+    for (int cid = 0; cid < m; ++cid) {
+      unassigned[cid] = static_cast<int>(local_constraints[cid].vars.size());
+    }
+
+    std::function<void(int)> dfs_approx = [&](int idx) {
+      if (truncated) {
+        return;
+      }
+      if (++visited_nodes > kApproxNodeLimit) {
+        truncated = true;
+        return;
+      }
       if (idx == n) {
-        total_solutions += 1.0L;
-        solutions_by_mines[assigned_mine_total] += 1.0L;
+        sampled_solutions += 1.0L;
         for (int v = 0; v < n; ++v) {
           if (assign[v] == 1) {
-            mine_solutions_by_mines[v][assigned_mine_total] += 1.0L;
+            sampled_mines[v] += 1.0L;
           }
+        }
+        if (sampled_solutions >= static_cast<long double>(kApproxSolutionLimit)) {
+          truncated = true;
         }
         return;
       }
+
       int v = order[idx];
-      for (int val = 0; val <= 1; ++val) {
+      int first_val = ((idx + n + assigned_mine_total) & 1);
+      for (int t = 0; t < 2; ++t) {
+        int val = (t == 0) ? first_val : (1 - first_val);
         bool ok = true;
         for (int cid : local_incident[v]) {
           unassigned[cid]--;
@@ -357,7 +458,7 @@ Action BuildAndSolveFrontier() {
         assign[v] = val;
         assigned_mine_total += val;
         if (ok) {
-          dfs(idx + 1);
+          dfs_approx(idx + 1);
         }
         assigned_mine_total -= val;
         assign[v] = -1;
@@ -365,37 +466,26 @@ Action BuildAndSolveFrontier() {
           assigned_mines[cid] -= val;
           unassigned[cid]++;
         }
+        if (truncated) {
+          break;
+        }
       }
     };
-    dfs(0);
 
-    if (total_solutions == 0) {
+    dfs_approx(0);
+    if (sampled_solutions == 0.0L) {
       continue;
     }
-
-    int comp_index = static_cast<int>(component_models.size());
-    ComponentModel model;
-    model.global_cells = comp_cells;
-    model.ways_by_mines = solutions_by_mines;
-    model.mine_ways_by_cell = mine_solutions_by_mines;
-    component_models.push_back(model);
-
     for (int local = 0; local < n; ++local) {
       int global = comp_cells[local];
-      frontier_component[global] = comp_index;
-      frontier_local[global] = local;
-      long double mine_sum = 0.0L;
-      for (int k = 0; k <= n; ++k) {
-        mine_sum += mine_solutions_by_mines[local][k];
-      }
-      if (mine_sum == 0.0L) {
-        forced_safe[global] = 1;
-        mine_probability[global] = 0.0;
-      } else if (mine_sum == total_solutions) {
-        forced_mine[global] = 1;
-        mine_probability[global] = 1.0;
-      } else {
-        mine_probability[global] = static_cast<double>(mine_sum / total_solutions);
+      double prob = static_cast<double>(sampled_mines[local] / sampled_solutions);
+      mine_probability[global] = prob;
+      if (!truncated) {
+        if (sampled_mines[local] == 0.0L) {
+          forced_safe[global] = 1;
+        } else if (sampled_mines[local] == sampled_solutions) {
+          forced_mine[global] = 1;
+        }
       }
     }
   }
